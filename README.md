@@ -23,7 +23,7 @@ This is the home of the pi agent harness project including our self extensible c
 
 ## Fork Policy: Local Manual Installs Only
 
-This fork is maintained for local installs on the owner's machines. It intentionally does not use GitHub Actions, CI/CD publishing, or repository automation. Verify changes locally with `npm run check` and targeted tests when needed.
+This fork is maintained for local installs on the owner's machines. It intentionally does not use GitHub Actions, CI/CD publishing, or repository automation. Workflow files from upstream must not be merged into this fork; `npm run check` fails if `.github/workflows` contains files. Verify changes locally with `npm run check` and targeted tests when needed.
 
 * **[@earendil-works/pi-coding-agent](packages/coding-agent)**: Interactive coding agent CLI
 * **[@earendil-works/pi-agent-core](packages/agent)**: Agent runtime with tool calling and state management

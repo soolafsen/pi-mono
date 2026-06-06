@@ -15,6 +15,8 @@
 - Do not add, edit, enable, depend on, or ask for GitHub Actions workflows.
 - Do not request GitHub OAuth `workflow` scope for routine work in this fork.
 - Do not modify `.github/workflows` unless the user explicitly asks to reintroduce workflows.
+- Never merge `.github/workflows` from upstream. Use a fork-local squash/update flow that leaves `.github/workflows` absent.
+- `npm run check`, pre-commit, and pre-merge-commit run `scripts/check-no-workflows.mjs` and must fail if workflow files appear.
 - Verification is local: use `npm run check` and targeted tests as requested.
 - Upstream CI/CD documentation is historical context only and does not apply to this fork.
 

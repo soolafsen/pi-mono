@@ -1,0 +1,8 @@
+#!/bin/sh
+
+node scripts/check-no-workflows.mjs
+if [ $? -ne 0 ]; then
+  echo "❌ Merge introduced forbidden GitHub Actions workflows."
+  echo "Remove .github/workflows files, then continue the merge."
+  exit 1
+fi

@@ -39,3 +39,6 @@ plans/
 .pi/hf-sessions/
 .pi/hf-sessions-backup/
 collect.sh
+
+# This fork is local-only and must not carry GitHub Actions workflows.
+.github/workflows/
