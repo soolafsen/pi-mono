@@ -6,10 +6,32 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { performance } from "node:perf_hooks";
-import { isKeyRelease, matchesKey } from "./keys.js";
-import type { Terminal } from "./terminal.js";
-import { getCapabilities, isImageLine, setCellDimensions } from "./terminal-image.js";
-import { extractSegments, sliceByColumn, sliceWithWidth, visibleWidth } from "./utils.js";
+import { isKeyRelease, matchesKey } from "./keys.ts";
+import type { Terminal } from "./terminal.ts";
+import { deleteKittyImage, getCapabilities, isImageLine, setCellDimensions } from "./terminal-image.ts";
+import { extractSegments, normalizeTerminalOutput, sliceByColumn, sliceWithWidth, visibleWidth } from "./utils.ts";
+
+const KITTY_SEQUENCE_PREFIX = "\x1b_G";
+
+function extractKittyImageIds(line: string): number[] {
+	const sequenceStart = line.indexOf(KITTY_SEQUENCE_PREFIX);
+	if (sequenceStart === -1) return [];
+
+	const paramsStart = sequenceStart + KITTY_SEQUENCE_PREFIX.length;
+	const paramsEnd = line.indexOf(";", paramsStart);
+	if (paramsEnd === -1) return [];
+
+	const params = line.slice(paramsStart, paramsEnd);
+	for (const param of params.split(",")) {
+		const [key, value] = param.split("=", 2);
+		if (key !== "i" || value === undefined) continue;
+		const id = Number(value);
+		if (Number.isInteger(id) && id > 0 && id <= 0xffffffff) {
+			return [id];
+		}
+	}
+	return [];
+}
 
 /**
  * Component interface - all components must implement this
@@ -154,6 +176,12 @@ export interface OverlayOptions {
 	nonCapturing?: boolean;
 }
 
+/** Options for {@link OverlayHandle.unfocus}. */
+export interface OverlayUnfocusOptions {
+	/** Explicit target to focus after releasing this overlay. */
+	target: Component | null;
+}
+
 /**
  * Handle returned by showOverlay for controlling the overlay
  */
@@ -166,11 +194,31 @@ export interface OverlayHandle {
 	isHidden(): boolean;
 	/** Focus this overlay and bring it to the visual front */
 	focus(): void;
-	/** Release focus to the previous target */
-	unfocus(): void;
+	/** Release focus to the next visible capturing overlay or previous target, or to an explicit target when provided */
+	unfocus(options?: OverlayUnfocusOptions): void;
 	/** Check if this overlay currently has focus */
 	isFocused(): boolean;
 }
+
+type OverlayStackEntry = {
+	component: Component;
+	options?: OverlayOptions;
+	preFocus: Component | null;
+	hidden: boolean;
+	focusOrder: number;
+};
+
+type OverlayBlockedFocusResume = { status: "restore-overlay" } | { status: "focus-target"; target: Component | null };
+type EligibleOverlayFocusRestoreState = { status: "eligible"; overlay: OverlayStackEntry };
+type BlockedOverlayFocusRestoreState = {
+	status: "blocked";
+	overlay: OverlayStackEntry;
+	blockedBy: Component;
+	resume: OverlayBlockedFocusResume;
+};
+type ActiveOverlayFocusRestoreState = EligibleOverlayFocusRestoreState | BlockedOverlayFocusRestoreState;
+type OverlayFocusRestoreState = { status: "inactive" } | ActiveOverlayFocusRestoreState;
+type OverlayFocusRestorePolicy = "clear" | "preserve";
 
 /**
  * Container - a component that contains other components
@@ -202,7 +250,10 @@ export class Container implements Component {
 	render(width: number): string[] {
 		const lines: string[] = [];
 		for (const child of this.children) {
-			lines.push(...child.render(width));
+			const childLines = child.render(width);
+			for (const line of childLines) {
+				lines.push(line);
+			}
 		}
 		return lines;
 	}
@@ -214,6 +265,7 @@ export class Container implements Component {
 export class TUI extends Container {
 	public terminal: Terminal;
 	private previousLines: string[] = [];
+	private previousKittyImageIds = new Set<number>();
 	private previousWidth = 0;
 	private previousHeight = 0;
 	private focusedComponent: Component | null = null;
@@ -236,13 +288,8 @@ export class TUI extends Container {
 
 	// Overlay stack for modal components rendered on top of base content
 	private focusOrderCounter = 0;
-	private overlayStack: {
-		component: Component;
-		options?: OverlayOptions;
-		preFocus: Component | null;
-		hidden: boolean;
-		focusOrder: number;
-	}[] = [];
+	private overlayStack: OverlayStackEntry[] = [];
+	private overlayFocusRestore: OverlayFocusRestoreState = { status: "inactive" };
 
 	constructor(terminal: Terminal, showHardwareCursor?: boolean) {
 		super();
@@ -283,17 +330,126 @@ export class TUI extends Container {
 	}
 
 	setFocus(component: Component | null): void {
-		// Clear focused flag on old component
+		this.setFocusInternal({ component, overlayFocusRestore: "clear" });
+	}
+
+	private setFocusInternal({
+		component,
+		overlayFocusRestore,
+	}: {
+		component: Component | null;
+		overlayFocusRestore: OverlayFocusRestorePolicy;
+	}): void {
+		const previousFocus = this.focusedComponent;
+		let nextFocus = component;
+		const previousFocusedOverlay = previousFocus
+			? this.overlayStack.find((entry) => entry.component === previousFocus && this.isOverlayVisible(entry))
+			: undefined;
+		const nextFocusIsOverlay = nextFocus ? this.overlayStack.some((entry) => entry.component === nextFocus) : false;
+		const restoreState = this.getVisibleOverlayFocusRestore();
+		if (nextFocus && !nextFocusIsOverlay) {
+			if (restoreState.status === "blocked" && restoreState.blockedBy === previousFocus) {
+				if (restoreState.resume.status === "focus-target" || !this.isComponentMounted(restoreState.blockedBy)) {
+					nextFocus = this.resolveBlockedOverlayFocusResume(restoreState);
+				} else {
+					this.overlayFocusRestore = {
+						status: "blocked",
+						overlay: restoreState.overlay,
+						blockedBy: nextFocus,
+						resume: restoreState.resume,
+					};
+				}
+			} else if (
+				previousFocusedOverlay &&
+				restoreState.status !== "inactive" &&
+				restoreState.overlay === previousFocusedOverlay &&
+				!this.isOverlayFocusAncestor(previousFocusedOverlay, nextFocus)
+			) {
+				this.overlayFocusRestore = {
+					status: "blocked",
+					overlay: previousFocusedOverlay,
+					blockedBy: nextFocus,
+					resume: { status: "restore-overlay" },
+				};
+			}
+		} else if (nextFocus === null) {
+			if (restoreState.status === "blocked" && restoreState.blockedBy === previousFocus) {
+				nextFocus = this.resolveBlockedOverlayFocusResume(restoreState);
+			} else if (overlayFocusRestore === "clear") {
+				this.clearOverlayFocusRestore();
+			}
+		}
+
 		if (isFocusable(this.focusedComponent)) {
 			this.focusedComponent.focused = false;
 		}
 
-		this.focusedComponent = component;
+		this.focusedComponent = nextFocus;
 
-		// Set focused flag on new component
-		if (isFocusable(component)) {
-			component.focused = true;
+		if (isFocusable(nextFocus)) {
+			nextFocus.focused = true;
 		}
+
+		const focusedOverlay = nextFocus
+			? this.overlayStack.find((entry) => entry.component === nextFocus && this.isOverlayVisible(entry))
+			: undefined;
+		if (focusedOverlay) {
+			this.overlayFocusRestore = { status: "eligible", overlay: focusedOverlay };
+		}
+	}
+
+	private clearOverlayFocusRestore(): void {
+		this.overlayFocusRestore = { status: "inactive" };
+	}
+
+	private clearOverlayFocusRestoreFor(overlay: OverlayStackEntry): void {
+		if (this.overlayFocusRestore.status !== "inactive" && this.overlayFocusRestore.overlay === overlay) {
+			this.clearOverlayFocusRestore();
+		}
+	}
+
+	private resolveBlockedOverlayFocusResume(restoreState: BlockedOverlayFocusRestoreState): Component | null {
+		if (restoreState.resume.status === "restore-overlay") return restoreState.overlay.component;
+		this.clearOverlayFocusRestore();
+		return restoreState.resume.target;
+	}
+
+	private getVisibleOverlayFocusRestore(): OverlayFocusRestoreState {
+		const restoreState = this.overlayFocusRestore;
+		if (restoreState.status === "inactive") return restoreState;
+		if (!this.overlayStack.includes(restoreState.overlay) || !this.isOverlayVisible(restoreState.overlay)) {
+			return { status: "inactive" };
+		}
+		return restoreState;
+	}
+
+	private isOverlayFocusAncestor(entry: OverlayStackEntry, component: Component): boolean {
+		const visited = new Set<Component>();
+		let current = entry.preFocus;
+		while (current && !visited.has(current)) {
+			visited.add(current);
+			if (current === component) return true;
+			current = this.overlayStack.find((overlay) => overlay.component === current)?.preFocus ?? null;
+		}
+		return false;
+	}
+
+	private retargetOverlayPreFocus(removed: OverlayStackEntry): void {
+		for (const overlay of this.overlayStack) {
+			if (overlay !== removed && overlay.preFocus === removed.component) {
+				overlay.preFocus = removed.preFocus;
+			}
+		}
+	}
+
+	private isComponentMounted(component: Component): boolean {
+		return this.children.some((child) => this.containsComponent(child, component));
+	}
+
+	private containsComponent(root: Component, target: Component): boolean {
+		if (root === target) return true;
+		if (!(root instanceof Container)) return false;
+		return root.children.some((child) => this.containsComponent(child, target));
 	}
 
 	/**
@@ -301,9 +457,9 @@ export class TUI extends Container {
 	 * Returns a handle to control the overlay's visibility.
 	 */
 	showOverlay(component: Component, options?: OverlayOptions): OverlayHandle {
-		const entry = {
+		const entry: OverlayStackEntry = {
 			component,
-			options,
+			...(options === undefined ? {} : { options }),
 			preFocus: this.focusedComponent,
 			hidden: false,
 			focusOrder: ++this.focusOrderCounter,
@@ -321,6 +477,8 @@ export class TUI extends Container {
 			hide: () => {
 				const index = this.overlayStack.indexOf(entry);
 				if (index !== -1) {
+					this.clearOverlayFocusRestoreFor(entry);
+					this.retargetOverlayPreFocus(entry);
 					this.overlayStack.splice(index, 1);
 					// Restore focus if this overlay had focus
 					if (this.focusedComponent === component) {
@@ -336,6 +494,7 @@ export class TUI extends Container {
 				entry.hidden = hidden;
 				// Update focus when hiding/showing
 				if (hidden) {
+					this.clearOverlayFocusRestoreFor(entry);
 					// If this overlay had focus, move focus to next visible or preFocus
 					if (this.focusedComponent === component) {
 						const topVisible = this.getTopmostVisibleOverlay();
@@ -353,16 +512,39 @@ export class TUI extends Container {
 			isHidden: () => entry.hidden,
 			focus: () => {
 				if (!this.overlayStack.includes(entry) || !this.isOverlayVisible(entry)) return;
-				if (this.focusedComponent !== component) {
-					this.setFocus(component);
-				}
 				entry.focusOrder = ++this.focusOrderCounter;
+				this.setFocus(component);
 				this.requestRender();
 			},
-			unfocus: () => {
-				if (this.focusedComponent !== component) return;
-				const topVisible = this.getTopmostVisibleOverlay();
-				this.setFocus(topVisible && topVisible !== entry ? topVisible.component : entry.preFocus);
+			unfocus: (unfocusOptions) => {
+				const isFocused = this.focusedComponent === component;
+				const restoreState = this.overlayFocusRestore;
+				const hasPendingRestore = restoreState.status !== "inactive" && restoreState.overlay === entry;
+				if (!isFocused && !hasPendingRestore) return;
+				if (
+					restoreState.status === "blocked" &&
+					restoreState.overlay === entry &&
+					this.focusedComponent === restoreState.blockedBy
+				) {
+					if (unfocusOptions) {
+						this.overlayFocusRestore = {
+							status: "blocked",
+							overlay: entry,
+							blockedBy: restoreState.blockedBy,
+							resume: { status: "focus-target", target: unfocusOptions.target },
+						};
+					} else {
+						this.clearOverlayFocusRestore();
+					}
+					this.requestRender();
+					return;
+				}
+				this.clearOverlayFocusRestoreFor(entry);
+				if (isFocused || unfocusOptions) {
+					const topVisible = this.getTopmostVisibleOverlay();
+					const fallbackTarget = topVisible && topVisible !== entry ? topVisible.component : entry.preFocus;
+					this.setFocus(unfocusOptions ? unfocusOptions.target : fallbackTarget);
+				}
 				this.requestRender();
 			},
 			isFocused: () => this.focusedComponent === component,
@@ -371,8 +553,11 @@ export class TUI extends Container {
 
 	/** Hide the topmost overlay and restore previous focus. */
 	hideOverlay(): void {
-		const overlay = this.overlayStack.pop();
+		const overlay = this.overlayStack[this.overlayStack.length - 1];
 		if (!overlay) return;
+		this.clearOverlayFocusRestoreFor(overlay);
+		this.retargetOverlayPreFocus(overlay);
+		this.overlayStack.pop();
 		if (this.focusedComponent === overlay.component) {
 			// Find topmost visible overlay, or fall back to preFocus
 			const topVisible = this.getTopmostVisibleOverlay();
@@ -388,7 +573,7 @@ export class TUI extends Container {
 	}
 
 	/** Check if an overlay entry is currently visible */
-	private isOverlayVisible(entry: (typeof this.overlayStack)[number]): boolean {
+	private isOverlayVisible(entry: OverlayStackEntry): boolean {
 		if (entry.hidden) return false;
 		if (entry.options?.visible) {
 			return entry.options.visible(this.terminal.columns, this.terminal.rows);
@@ -396,15 +581,16 @@ export class TUI extends Container {
 		return true;
 	}
 
-	/** Find the topmost visible capturing overlay, if any */
-	private getTopmostVisibleOverlay(): (typeof this.overlayStack)[number] | undefined {
-		for (let i = this.overlayStack.length - 1; i >= 0; i--) {
-			if (this.overlayStack[i].options?.nonCapturing) continue;
-			if (this.isOverlayVisible(this.overlayStack[i])) {
-				return this.overlayStack[i];
+	/** Find the visual-frontmost visible capturing overlay, if any */
+	private getTopmostVisibleOverlay(): OverlayStackEntry | undefined {
+		let topmost: OverlayStackEntry | undefined;
+		for (const overlay of this.overlayStack) {
+			if (overlay.options?.nonCapturing || !this.isOverlayVisible(overlay)) continue;
+			if (!topmost || overlay.focusOrder > topmost.focusOrder) {
+				topmost = overlay;
 			}
 		}
-		return undefined;
+		return topmost;
 	}
 
 	override invalidate(): void {
@@ -553,8 +739,22 @@ export class TUI extends Container {
 			if (topVisible) {
 				this.setFocus(topVisible.component);
 			} else {
-				// No visible overlays, restore to preFocus
-				this.setFocus(focusedOverlay.preFocus);
+				this.setFocusInternal({ component: focusedOverlay.preFocus, overlayFocusRestore: "preserve" });
+			}
+		}
+
+		const focusIsOverlay = this.overlayStack.some((o) => o.component === this.focusedComponent);
+		if (!focusIsOverlay) {
+			const restoreState = this.getVisibleOverlayFocusRestore();
+			if (restoreState.status === "eligible") {
+				this.setFocus(restoreState.overlay.component);
+			} else if (restoreState.status === "blocked" && restoreState.blockedBy !== this.focusedComponent) {
+				if (restoreState.resume.status === "restore-overlay") {
+					this.setFocus(restoreState.overlay.component);
+				} else {
+					this.clearOverlayFocusRestore();
+					this.setFocus(restoreState.resume.target);
+				}
 			}
 		}
 
@@ -797,10 +997,52 @@ export class TUI extends Container {
 		for (let i = 0; i < lines.length; i++) {
 			const line = lines[i];
 			if (!isImageLine(line)) {
-				lines[i] = line + reset;
+				lines[i] = normalizeTerminalOutput(line) + reset;
 			}
 		}
 		return lines;
+	}
+
+	private collectKittyImageIds(lines: string[]): Set<number> {
+		const ids = new Set<number>();
+		for (const line of lines) {
+			for (const id of extractKittyImageIds(line)) {
+				ids.add(id);
+			}
+		}
+		return ids;
+	}
+
+	private deleteKittyImages(ids: Iterable<number>): string {
+		let buffer = "";
+		for (const id of ids) {
+			buffer += deleteKittyImage(id);
+		}
+		return buffer;
+	}
+
+	private expandLastChangedForKittyImages(firstChanged: number, lastChanged: number): number {
+		let expandedLastChanged = lastChanged;
+		for (let i = firstChanged; i < this.previousLines.length; i++) {
+			if (extractKittyImageIds(this.previousLines[i]).length > 0) {
+				expandedLastChanged = Math.max(expandedLastChanged, i);
+			}
+		}
+		return expandedLastChanged;
+	}
+
+	private deleteChangedKittyImages(firstChanged: number, lastChanged: number): string {
+		if (firstChanged < 0 || lastChanged < firstChanged) return "";
+
+		const ids = new Set<number>();
+		const maxLine = Math.min(lastChanged, this.previousLines.length - 1);
+		for (let i = firstChanged; i <= maxLine; i++) {
+			for (const id of extractKittyImageIds(this.previousLines[i] ?? "")) {
+				ids.add(id);
+			}
+		}
+
+		return this.deleteKittyImages(ids);
 	}
 
 	/** Splice overlay content into a base line at a specific column. Single-pass optimized. */
@@ -915,7 +1157,10 @@ export class TUI extends Container {
 		const fullRender = (clear: boolean): void => {
 			this.fullRedrawCount += 1;
 			let buffer = "\x1b[?2026h"; // Begin synchronized output
-			if (clear) buffer += "\x1b[2J\x1b[H\x1b[3J"; // Clear screen, home, then clear scrollback
+			if (clear) {
+				buffer += this.deleteKittyImages(this.previousKittyImageIds);
+				buffer += "\x1b[2J\x1b[H\x1b[3J"; // Clear screen, home, then clear scrollback
+			}
 			for (let i = 0; i < newLines.length; i++) {
 				if (i > 0) buffer += "\r\n";
 				buffer += newLines[i];
@@ -934,6 +1179,7 @@ export class TUI extends Container {
 			this.previousViewportTop = Math.max(0, bufferLength - height);
 			this.positionHardwareCursor(cursorPos, newLines.length);
 			this.previousLines = newLines;
+			this.previousKittyImageIds = this.collectKittyImageIds(newLines);
 			this.previousWidth = width;
 			this.previousHeight = height;
 		};
@@ -1000,6 +1246,9 @@ export class TUI extends Container {
 			}
 			lastChanged = newLines.length - 1;
 		}
+		if (firstChanged !== -1) {
+			lastChanged = this.expandLastChangedForKittyImages(firstChanged, lastChanged);
+		}
 		const appendStart = appendedLines && firstChanged === this.previousLines.length && firstChanged > 0;
 
 		// No changes - but still need to update hardware cursor position if it moved
@@ -1014,6 +1263,7 @@ export class TUI extends Container {
 		if (firstChanged >= newLines.length) {
 			if (this.previousLines.length > newLines.length) {
 				let buffer = "\x1b[?2026h";
+				buffer += this.deleteChangedKittyImages(firstChanged, lastChanged);
 				// Move to end of new content (clamp to 0 for empty content)
 				const targetRow = Math.max(0, newLines.length - 1);
 				if (targetRow < prevViewportTop) {
@@ -1049,6 +1299,7 @@ export class TUI extends Container {
 			}
 			this.positionHardwareCursor(cursorPos, newLines.length);
 			this.previousLines = newLines;
+			this.previousKittyImageIds = this.collectKittyImageIds(newLines);
 			this.previousWidth = width;
 			this.previousHeight = height;
 			this.previousViewportTop = prevViewportTop;
@@ -1066,6 +1317,7 @@ export class TUI extends Container {
 		// Render from first changed line to end
 		// Build buffer with all updates wrapped in synchronized output
 		let buffer = "\x1b[?2026h"; // Begin synchronized output
+		buffer += this.deleteChangedKittyImages(firstChanged, lastChanged);
 		const prevViewportBottom = prevViewportTop + height - 1;
 		const moveTargetRow = appendStart ? firstChanged - 1 : firstChanged;
 		if (moveTargetRow > prevViewportBottom) {
@@ -1196,6 +1448,7 @@ export class TUI extends Container {
 		this.positionHardwareCursor(cursorPos, newLines.length);
 
 		this.previousLines = newLines;
+		this.previousKittyImageIds = this.collectKittyImageIds(newLines);
 		this.previousWidth = width;
 		this.previousHeight = height;
 	}

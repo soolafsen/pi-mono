@@ -1,13 +1,15 @@
-import type { AutocompleteProvider, AutocompleteSuggestions, CombinedAutocompleteProvider } from "../autocomplete.js";
-import { getKeybindings } from "../keybindings.js";
-import { decodeKittyPrintable, matchesKey } from "../keys.js";
-import { KillRing } from "../kill-ring.js";
-import { type Component, CURSOR_MARKER, type Focusable, type TUI } from "../tui.js";
-import { UndoStack } from "../undo-stack.js";
-import { getSegmenter, isPunctuationChar, isWhitespaceChar, truncateToWidth, visibleWidth } from "../utils.js";
-import { SelectList, type SelectListLayoutOptions, type SelectListTheme } from "./select-list.js";
+import type { AutocompleteProvider, AutocompleteSuggestions } from "../autocomplete.ts";
+import { getKeybindings } from "../keybindings.ts";
+import { decodePrintableKey, matchesKey } from "../keys.ts";
+import { KillRing } from "../kill-ring.ts";
+import { type Component, CURSOR_MARKER, type Focusable, type TUI } from "../tui.ts";
+import { UndoStack } from "../undo-stack.ts";
+import { getGraphemeSegmenter, getWordSegmenter, isWhitespaceChar, truncateToWidth, visibleWidth } from "../utils.ts";
+import { findWordBackward, findWordForward } from "../word-navigation.ts";
+import { SelectList, type SelectListLayoutOptions, type SelectListTheme } from "./select-list.ts";
 
-const baseSegmenter = getSegmenter();
+const graphemeSegmenter = getGraphemeSegmenter();
+const wordSegmenter = getWordSegmenter();
 
 /** Regex matching paste markers like `[paste #1 +123 lines]` or `[paste #2 1234 chars]`. */
 const PASTE_MARKER_REGEX = /\[paste #(\d+)( (\+\d+ lines|\d+ chars))?\]/g;
@@ -27,7 +29,11 @@ function isPasteMarker(segment: string): boolean {
  *
  * Only markers whose numeric ID exists in `validIds` are merged.
  */
-function segmentWithMarkers(text: string, validIds: Set<number>): Iterable<Intl.SegmentData> {
+function segmentWithMarkers(
+	text: string,
+	baseSegmenter: Intl.Segmenter,
+	validIds: Set<number>,
+): Iterable<Intl.SegmentData> {
 	// Fast path: no paste markers in the text or no valid IDs.
 	if (validIds.size === 0 || !text.includes("[paste #")) {
 		return baseSegmenter.segment(text);
@@ -109,7 +115,7 @@ export function wordWrapLine(line: string, maxWidth: number, preSegmented?: Intl
 	}
 
 	const chunks: TextChunk[] = [];
-	const segments = preSegmented ?? [...baseSegmenter.segment(line)];
+	const segments = preSegmented ?? [...graphemeSegmenter.segment(line)];
 
 	let currentWidth = 0;
 	let chunkStart = 0;
@@ -271,6 +277,13 @@ export class Editor implements Component, Focusable {
 	// Preferred visual column for vertical cursor movement (sticky column)
 	private preferredVisualCol: number | null = null;
 
+	// When the cursor is snapped to the start of an atomic segment, e.g. a
+	// paste marker, cursorCol no longer reflects where the cursor would have
+	// landed. This field stores the pre-snap cursorCol so that the next
+	// vertical move can resolve it to a visual column on whatever VL it belongs
+	// to.
+	private snappedFromCursorCol: number | null = null;
+
 	// Undo support
 	private undoStack = new UndoStack<EditorState>();
 
@@ -294,8 +307,8 @@ export class Editor implements Component, Focusable {
 	}
 
 	/** Segment text with paste-marker awareness, only merging markers with valid IDs. */
-	private segment(text: string): Iterable<Intl.SegmentData> {
-		return segmentWithMarkers(text, this.validPasteIds());
+	private segment(text: string, mode: "word" | "grapheme"): Iterable<Intl.SegmentData> {
+		return segmentWithMarkers(text, mode === "word" ? wordSegmenter : graphemeSegmenter, this.validPasteIds());
 	}
 
 	getPaddingX(): number {
@@ -475,7 +488,7 @@ export class Editor implements Component, Focusable {
 				if (after.length > 0) {
 					// Cursor is on a character (grapheme) - replace it with highlighted version
 					// Get the first grapheme from 'after'
-					const afterGraphemes = [...this.segment(after)];
+					const afterGraphemes = [...this.segment(after, "grapheme")];
 					const firstGrapheme = afterGraphemes[0]?.segment || "";
 					const restAfter = after.slice(firstGrapheme.length);
 					const cursor = `\x1b[7m${firstGrapheme}\x1b[0m`;
@@ -535,11 +548,12 @@ export class Editor implements Component, Focusable {
 				return;
 			}
 
-			if (data.charCodeAt(0) >= 32) {
+			const printable = decodePrintableKey(data) ?? (data.charCodeAt(0) >= 32 ? data : undefined);
+			if (printable !== undefined) {
 				// Printable character - perform the jump
 				const direction = this.jumpMode;
 				this.jumpMode = null;
-				this.jumpToChar(data, direction);
+				this.jumpToChar(printable, direction);
 				return;
 			}
 
@@ -800,9 +814,9 @@ export class Editor implements Component, Focusable {
 			return;
 		}
 
-		const kittyPrintable = decodeKittyPrintable(data);
-		if (kittyPrintable !== undefined) {
-			this.insertCharacter(kittyPrintable);
+		const printable = decodePrintableKey(data);
+		if (printable !== undefined) {
+			this.insertCharacter(printable);
 			return;
 		}
 
@@ -847,7 +861,7 @@ export class Editor implements Component, Focusable {
 				}
 			} else {
 				// Line needs wrapping - use word-aware wrapping
-				const chunks = wordWrapLine(line, contentWidth, [...this.segment(line)]);
+				const chunks = wordWrapLine(line, contentWidth, [...this.segment(line, "grapheme")]);
 
 				for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex++) {
 					const chunk = chunks[chunkIndex];
@@ -1046,17 +1060,16 @@ export class Editor implements Component, Focusable {
 			if (char === "/" && this.isAtStartOfMessage()) {
 				this.tryTriggerAutocomplete();
 			}
-			// Auto-trigger for "@" file reference (fuzzy search)
-			else if (char === "@") {
+			// Auto-trigger for symbol-based completion like @ or # at token boundaries
+			else if (char === "@" || char === "#") {
 				const currentLine = this.state.lines[this.state.cursorLine] || "";
 				const textBeforeCursor = currentLine.slice(0, this.state.cursorCol);
-				// Only trigger if @ is after whitespace or at start of line
-				const charBeforeAt = textBeforeCursor[textBeforeCursor.length - 2];
-				if (textBeforeCursor.length === 1 || charBeforeAt === " " || charBeforeAt === "\t") {
+				const charBeforeSymbol = textBeforeCursor[textBeforeCursor.length - 2];
+				if (textBeforeCursor.length === 1 || charBeforeSymbol === " " || charBeforeSymbol === "\t") {
 					this.tryTriggerAutocomplete();
 				}
 			}
-			// Also auto-trigger when typing letters in a slash command context
+			// Also auto-trigger when typing letters in a slash command or symbol completion context
 			else if (/[a-zA-Z0-9.\-_]/.test(char)) {
 				const currentLine = this.state.lines[this.state.cursorLine] || "";
 				const textBeforeCursor = currentLine.slice(0, this.state.cursorCol);
@@ -1064,8 +1077,8 @@ export class Editor implements Component, Focusable {
 				if (this.isInSlashCommandContext(textBeforeCursor)) {
 					this.tryTriggerAutocomplete();
 				}
-				// Check if we're in an @ file reference context
-				else if (textBeforeCursor.match(/(?:^|[\s])@[^\s]*$/)) {
+				// Check if we're in a symbol-based completion context like @ or #
+				else if (textBeforeCursor.match(/(?:^|[\s])[@#][^\s]*$/)) {
 					this.tryTriggerAutocomplete();
 				}
 			}
@@ -1081,8 +1094,20 @@ export class Editor implements Component, Focusable {
 
 		this.pushUndoSnapshot();
 
+		// Some terminals (e.g. tmux popups with extended-keys-format=csi-u) re-encode
+		// control bytes inside bracketed paste as CSI-u Ctrl+<letter> sequences
+		// (ESC [ <codepoint> ; 5 u). Decode those back to their literal byte so the
+		// per-char filter below preserves newlines instead of stripping ESC and
+		// leaking the printable tail (e.g. "[106;5u") into the editor.
+		const decodedText = pastedText.replace(/\x1b\[(\d+);5u/g, (match, code) => {
+			const cp = Number(code);
+			if (cp >= 97 && cp <= 122) return String.fromCharCode(cp - 96);
+			if (cp >= 65 && cp <= 90) return String.fromCharCode(cp - 64);
+			return match;
+		});
+
 		// Clean the pasted text: normalize line endings, expand tabs
-		const cleanText = this.normalizeText(pastedText);
+		const cleanText = this.normalizeText(decodedText);
 
 		// Filter out non-printable characters except newlines
 		let filteredText = cleanText
@@ -1194,7 +1219,7 @@ export class Editor implements Component, Focusable {
 			const beforeCursor = line.slice(0, this.state.cursorCol);
 
 			// Find the last grapheme in the text before cursor
-			const graphemes = [...this.segment(beforeCursor)];
+			const graphemes = [...this.segment(beforeCursor, "grapheme")];
 			const lastGrapheme = graphemes[graphemes.length - 1];
 			const graphemeLength = lastGrapheme ? lastGrapheme.segment.length : 1;
 
@@ -1232,8 +1257,8 @@ export class Editor implements Component, Focusable {
 			if (this.isInSlashCommandContext(textBeforeCursor)) {
 				this.tryTriggerAutocomplete();
 			}
-			// @ file reference context
-			else if (textBeforeCursor.match(/(?:^|[\s])@[^\s]*$/)) {
+			// Symbol-based completion context like @ or #
+			else if (textBeforeCursor.match(/(?:^|[\s])[@#][^\s]*$/)) {
 				this.tryTriggerAutocomplete();
 			}
 		}
@@ -1246,6 +1271,7 @@ export class Editor implements Component, Focusable {
 	private setCursorCol(col: number): void {
 		this.state.cursorCol = col;
 		this.preferredVisualCol = null;
+		this.snappedFromCursorCol = null;
 	}
 
 	/**
@@ -1259,47 +1285,79 @@ export class Editor implements Component, Focusable {
 	): void {
 		const currentVL = visualLines[currentVisualLine];
 		const targetVL = visualLines[targetVisualLine];
+		if (!(currentVL && targetVL)) return;
 
-		if (currentVL && targetVL) {
-			const currentVisualCol = this.state.cursorCol - currentVL.startCol;
+		// When the cursor was snapped to a segment start, resolve the pre-snap
+		// position against the VL it belongs to. This gives the correct visual
+		// column even after a resize reshuffles VLs.
+		let currentVisualCol: number;
+		if (this.snappedFromCursorCol !== null) {
+			const vlIndex = this.findVisualLineAt(visualLines, currentVL.logicalLine, this.snappedFromCursorCol);
+			currentVisualCol = this.snappedFromCursorCol - visualLines[vlIndex].startCol;
+		} else {
+			currentVisualCol = this.state.cursorCol - currentVL.startCol;
+		}
 
-			// For non-last segments, clamp to length-1 to stay within the segment
-			const isLastSourceSegment =
-				currentVisualLine === visualLines.length - 1 ||
-				visualLines[currentVisualLine + 1]?.logicalLine !== currentVL.logicalLine;
-			const sourceMaxVisualCol = isLastSourceSegment ? currentVL.length : Math.max(0, currentVL.length - 1);
+		// For non-last segments, clamp to length-1 to stay within the segment
+		const isLastSourceSegment =
+			currentVisualLine === visualLines.length - 1 ||
+			visualLines[currentVisualLine + 1]?.logicalLine !== currentVL.logicalLine;
+		const sourceMaxVisualCol = isLastSourceSegment ? currentVL.length : Math.max(0, currentVL.length - 1);
 
-			const isLastTargetSegment =
-				targetVisualLine === visualLines.length - 1 ||
-				visualLines[targetVisualLine + 1]?.logicalLine !== targetVL.logicalLine;
-			const targetMaxVisualCol = isLastTargetSegment ? targetVL.length : Math.max(0, targetVL.length - 1);
+		const isLastTargetSegment =
+			targetVisualLine === visualLines.length - 1 ||
+			visualLines[targetVisualLine + 1]?.logicalLine !== targetVL.logicalLine;
+		const targetMaxVisualCol = isLastTargetSegment ? targetVL.length : Math.max(0, targetVL.length - 1);
 
-			const moveToVisualCol = this.computeVerticalMoveColumn(
-				currentVisualCol,
-				sourceMaxVisualCol,
-				targetMaxVisualCol,
-			);
+		const moveToVisualCol = this.computeVerticalMoveColumn(currentVisualCol, sourceMaxVisualCol, targetMaxVisualCol);
 
-			// Set cursor position
-			this.state.cursorLine = targetVL.logicalLine;
-			const targetCol = targetVL.startCol + moveToVisualCol;
-			const logicalLine = this.state.lines[targetVL.logicalLine] || "";
-			this.state.cursorCol = Math.min(targetCol, logicalLine.length);
+		// Set cursor position
+		this.state.cursorLine = targetVL.logicalLine;
+		const targetCol = targetVL.startCol + moveToVisualCol;
+		const logicalLine = this.state.lines[targetVL.logicalLine] || "";
+		this.state.cursorCol = Math.min(targetCol, logicalLine.length);
 
-			// Snap cursor to atomic segment boundary (e.g. paste markers)
-			// so the cursor never lands in the middle of a multi-grapheme unit.
-			// Single-grapheme segments don't need snapping.
-			const segments = [...this.segment(logicalLine)];
-			for (const seg of segments) {
-				if (seg.index > this.state.cursorCol) break;
-				if (seg.segment.length <= 1) continue;
-				if (this.state.cursorCol < seg.index + seg.segment.length) {
-					// jump to the start of the segment when moving up, to the end when moving down.
-					this.state.cursorCol = currentVisualLine > targetVisualLine ? seg.index : seg.index + seg.segment.length;
-					break;
+		// Snap cursor to atomic segment boundary (e.g. paste markers)
+		// so the cursor never lands in the middle of a multi-grapheme unit.
+		// Single-grapheme segments don't need snapping.
+		const segments = [...this.segment(logicalLine, "grapheme")];
+		for (const seg of segments) {
+			if (seg.index > this.state.cursorCol) break;
+			if (seg.segment.length <= 1) continue;
+			if (this.state.cursorCol < seg.index + seg.segment.length) {
+				const isContinuation = seg.index < targetVL.startCol;
+				const isMovingDown = targetVisualLine > currentVisualLine;
+
+				if (isContinuation && isMovingDown) {
+					// The segment started on a previous visual line, and we
+					// already visited it on the way down. Skip all remaining
+					// continuation VLs and land on the first VL past it.
+					const segEnd = seg.index + seg.segment.length;
+					let next = targetVisualLine + 1;
+					while (
+						next < visualLines.length &&
+						visualLines[next].logicalLine === targetVL.logicalLine &&
+						visualLines[next].startCol < segEnd
+					) {
+						next++;
+					}
+					if (next < visualLines.length) {
+						this.moveToVisualLine(visualLines, currentVisualLine, next);
+						return;
+					}
 				}
+
+				// Snap to the start of the segment so it gets highlighted.
+				// Store the pre-snap position so the next vertical move can
+				// resolve it to the correct visual column.
+				this.snappedFromCursorCol = this.state.cursorCol;
+				this.state.cursorCol = seg.index;
+				return;
 			}
 		}
+
+		// No snap occurred – we moved out of the atomic segment.
+		this.snappedFromCursorCol = null;
 	}
 
 	/**
@@ -1533,7 +1591,7 @@ export class Editor implements Component, Focusable {
 			const afterCursor = currentLine.slice(this.state.cursorCol);
 
 			// Find the first grapheme at cursor
-			const graphemes = [...this.segment(afterCursor)];
+			const graphemes = [...this.segment(afterCursor, "grapheme")];
 			const firstGrapheme = graphemes[0];
 			const graphemeLength = firstGrapheme ? firstGrapheme.segment.length : 1;
 
@@ -1563,8 +1621,8 @@ export class Editor implements Component, Focusable {
 			if (this.isInSlashCommandContext(textBeforeCursor)) {
 				this.tryTriggerAutocomplete();
 			}
-			// @ file reference context
-			else if (textBeforeCursor.match(/(?:^|[\s])@[^\s]*$/)) {
+			// Symbol-based completion context like @ or #
+			else if (textBeforeCursor.match(/(?:^|[\s])[@#][^\s]*$/)) {
 				this.tryTriggerAutocomplete();
 			}
 		}
@@ -1590,7 +1648,7 @@ export class Editor implements Component, Focusable {
 				visualLines.push({ logicalLine: i, startCol: 0, length: line.length });
 			} else {
 				// Line needs wrapping - use word-aware wrapping
-				const chunks = wordWrapLine(line, width, [...this.segment(line)]);
+				const chunks = wordWrapLine(line, width, [...this.segment(line, "grapheme")]);
 				for (const chunk of chunks) {
 					visualLines.push({
 						logicalLine: i,
@@ -1605,27 +1663,34 @@ export class Editor implements Component, Focusable {
 	}
 
 	/**
+	 * Find the visual line index that contains the given logical position.
+	 */
+	private findVisualLineAt(
+		visualLines: Array<{ logicalLine: number; startCol: number; length: number }>,
+		line: number,
+		col: number,
+	): number {
+		for (let i = 0; i < visualLines.length; i++) {
+			const vl = visualLines[i];
+			if (!vl || vl.logicalLine !== line) continue;
+			const offset = col - vl.startCol;
+			// Cursor is in this segment if it's within range. For the last
+			// segment of a logical line, cursor can be at length (end position)
+			const isLastSegmentOfLine = i === visualLines.length - 1 || visualLines[i + 1]?.logicalLine !== vl.logicalLine;
+			if (offset >= 0 && (offset < vl.length || (isLastSegmentOfLine && offset === vl.length))) {
+				return i;
+			}
+		}
+		return visualLines.length - 1;
+	}
+
+	/**
 	 * Find the visual line index for the current cursor position.
 	 */
 	private findCurrentVisualLine(
 		visualLines: Array<{ logicalLine: number; startCol: number; length: number }>,
 	): number {
-		for (let i = 0; i < visualLines.length; i++) {
-			const vl = visualLines[i];
-			if (!vl) continue;
-			if (vl.logicalLine === this.state.cursorLine) {
-				const colInSegment = this.state.cursorCol - vl.startCol;
-				// Cursor is in this segment if it's within range
-				// For the last segment of a logical line, cursor can be at length (end position)
-				const isLastSegmentOfLine =
-					i === visualLines.length - 1 || visualLines[i + 1]?.logicalLine !== vl.logicalLine;
-				if (colInSegment >= 0 && (colInSegment < vl.length || (isLastSegmentOfLine && colInSegment <= vl.length))) {
-					return i;
-				}
-			}
-		}
-		// Fallback: return last visual line
-		return visualLines.length - 1;
+		return this.findVisualLineAt(visualLines, this.state.cursorLine, this.state.cursorCol);
 	}
 
 	private moveCursor(deltaLine: number, deltaCol: number): void {
@@ -1648,7 +1713,7 @@ export class Editor implements Component, Focusable {
 				// Moving right - move by one grapheme (handles emojis, combining characters, etc.)
 				if (this.state.cursorCol < currentLine.length) {
 					const afterCursor = currentLine.slice(this.state.cursorCol);
-					const graphemes = [...this.segment(afterCursor)];
+					const graphemes = [...this.segment(afterCursor, "grapheme")];
 					const firstGrapheme = graphemes[0];
 					this.setCursorCol(this.state.cursorCol + (firstGrapheme ? firstGrapheme.segment.length : 1));
 				} else if (this.state.cursorLine < this.state.lines.length - 1) {
@@ -1666,7 +1731,7 @@ export class Editor implements Component, Focusable {
 				// Moving left - move by one grapheme (handles emojis, combining characters, etc.)
 				if (this.state.cursorCol > 0) {
 					const beforeCursor = currentLine.slice(0, this.state.cursorCol);
-					const graphemes = [...this.segment(beforeCursor)];
+					const graphemes = [...this.segment(beforeCursor, "grapheme")];
 					const lastGrapheme = graphemes[graphemes.length - 1];
 					this.setCursorCol(this.state.cursorCol - (lastGrapheme ? lastGrapheme.segment.length : 1));
 				} else if (this.state.cursorLine > 0) {
@@ -1709,47 +1774,12 @@ export class Editor implements Component, Focusable {
 			return;
 		}
 
-		const textBeforeCursor = currentLine.slice(0, this.state.cursorCol);
-		const graphemes = [...this.segment(textBeforeCursor)];
-		let newCol = this.state.cursorCol;
-
-		// Skip trailing whitespace
-		while (
-			graphemes.length > 0 &&
-			!isPasteMarker(graphemes[graphemes.length - 1]?.segment || "") &&
-			isWhitespaceChar(graphemes[graphemes.length - 1]?.segment || "")
-		) {
-			newCol -= graphemes.pop()?.segment.length || 0;
-		}
-
-		if (graphemes.length > 0) {
-			const lastGrapheme = graphemes[graphemes.length - 1]?.segment || "";
-			if (isPasteMarker(lastGrapheme)) {
-				// Paste marker is a single atomic word
-				newCol -= graphemes.pop()?.segment.length || 0;
-			} else if (isPunctuationChar(lastGrapheme)) {
-				// Skip punctuation run
-				while (
-					graphemes.length > 0 &&
-					isPunctuationChar(graphemes[graphemes.length - 1]?.segment || "") &&
-					!isPasteMarker(graphemes[graphemes.length - 1]?.segment || "")
-				) {
-					newCol -= graphemes.pop()?.segment.length || 0;
-				}
-			} else {
-				// Skip word run
-				while (
-					graphemes.length > 0 &&
-					!isWhitespaceChar(graphemes[graphemes.length - 1]?.segment || "") &&
-					!isPunctuationChar(graphemes[graphemes.length - 1]?.segment || "") &&
-					!isPasteMarker(graphemes[graphemes.length - 1]?.segment || "")
-				) {
-					newCol -= graphemes.pop()?.segment.length || 0;
-				}
-			}
-		}
-
-		this.setCursorCol(newCol);
+		this.setCursorCol(
+			findWordBackward(currentLine, this.state.cursorCol, {
+				segment: (text) => this.segment(text, "word"),
+				isAtomicSegment: isPasteMarker,
+			}),
+		);
 	}
 
 	/**
@@ -1936,44 +1966,12 @@ export class Editor implements Component, Focusable {
 			return;
 		}
 
-		const textAfterCursor = currentLine.slice(this.state.cursorCol);
-		const segments = this.segment(textAfterCursor);
-		const iterator = segments[Symbol.iterator]();
-		let next = iterator.next();
-		let newCol = this.state.cursorCol;
-
-		// Skip leading whitespace
-		while (!next.done && !isPasteMarker(next.value.segment) && isWhitespaceChar(next.value.segment)) {
-			newCol += next.value.segment.length;
-			next = iterator.next();
-		}
-
-		if (!next.done) {
-			const firstGrapheme = next.value.segment;
-			if (isPasteMarker(firstGrapheme)) {
-				// Paste marker is a single atomic word
-				newCol += firstGrapheme.length;
-			} else if (isPunctuationChar(firstGrapheme)) {
-				// Skip punctuation run
-				while (!next.done && isPunctuationChar(next.value.segment) && !isPasteMarker(next.value.segment)) {
-					newCol += next.value.segment.length;
-					next = iterator.next();
-				}
-			} else {
-				// Skip word run
-				while (
-					!next.done &&
-					!isWhitespaceChar(next.value.segment) &&
-					!isPunctuationChar(next.value.segment) &&
-					!isPasteMarker(next.value.segment)
-				) {
-					newCol += next.value.segment.length;
-					next = iterator.next();
-				}
-			}
-		}
-
-		this.setCursorCol(newCol);
+		this.setCursorCol(
+			findWordForward(currentLine, this.state.cursorCol, {
+				segment: (text) => this.segment(text, "word"),
+				isAtomicSegment: isPasteMarker,
+			}),
+		);
 	}
 
 	// Slash menu only allowed on the first line of the editor
@@ -2060,10 +2058,13 @@ export class Editor implements Component, Focusable {
 		if (!this.autocompleteProvider) return;
 
 		if (options.force) {
-			const provider = this.autocompleteProvider as CombinedAutocompleteProvider;
 			const shouldTrigger =
-				!provider.shouldTriggerFileCompletion ||
-				provider.shouldTriggerFileCompletion(this.state.lines, this.state.cursorLine, this.state.cursorCol);
+				!this.autocompleteProvider.shouldTriggerFileCompletion ||
+				this.autocompleteProvider.shouldTriggerFileCompletion(
+					this.state.lines,
+					this.state.cursorLine,
+					this.state.cursorCol,
+				);
 			if (!shouldTrigger) {
 				return;
 			}
@@ -2114,8 +2115,8 @@ export class Editor implements Component, Focusable {
 
 		const currentLine = this.state.lines[this.state.cursorLine] || "";
 		const textBeforeCursor = currentLine.slice(0, this.state.cursorCol);
-		const isAttachmentContext = /(?:^|[ \t])@(?:"[^"]*|[^\s]*)$/.test(textBeforeCursor);
-		return isAttachmentContext ? ATTACHMENT_AUTOCOMPLETE_DEBOUNCE_MS : 0;
+		const isSymbolAutocompleteContext = /(?:^|[ \t])(?:@(?:"[^"]*|[^\s]*)|#[^\s]*)$/.test(textBeforeCursor);
+		return isSymbolAutocompleteContext ? ATTACHMENT_AUTOCOMPLETE_DEBOUNCE_MS : 0;
 	}
 
 	private async runAutocompleteRequest(

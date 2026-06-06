@@ -2,6 +2,140 @@
 
 ## [Unreleased]
 
+## [0.78.1] - 2026-06-04
+
+## [0.78.0] - 2026-05-29
+
+## [0.77.0] - 2026-05-28
+
+### Breaking Changes
+
+- Renamed agent harness `model_select` and `thinking_level_select` events to `model_update` and `thinking_level_update`.
+
+### Added
+
+- Added agent harness tool registry APIs, `tools_update` events, branch-scoped active-tool persistence, and duplicate tool validation.
+
+## [0.76.0] - 2026-05-27
+
+### Fixed
+
+- Fixed context token estimates to count user image attachments consistently with tool result images ([#4983](https://github.com/earendil-works/pi/issues/4983)).
+
+## [0.75.5] - 2026-05-23
+
+## [0.75.4] - 2026-05-20
+
+### Changed
+
+- Changed source syntax to avoid TypeScript constructs that require JavaScript emit, keeping the package compatible with Node.js strip-only TypeScript checks.
+- Removed the package-level development watch script now that the root TypeScript check validates strip-only-compatible sources.
+
+### Fixed
+
+- Fixed tool-call preflight to stop preparing sibling tool calls after the run is aborted ([#4276](https://github.com/earendil-works/pi/issues/4276)).
+- Fixed tail truncation for oversized single-line output that ends with a trailing newline ([#4715](https://github.com/earendil-works/pi/issues/4715)).
+- Fixed Windows Node execution environment command spawns to hide helper console windows from background processes ([#4699](https://github.com/earendil-works/pi/issues/4699)).
+
+## [0.75.3] - 2026-05-18
+
+## [0.75.2] - 2026-05-18
+
+## [0.75.1] - 2026-05-18
+
+## [0.75.0] - 2026-05-17
+
+### Breaking Changes
+
+- Raised the minimum supported Node.js version to 22.19.0.
+
+## [0.74.1] - 2026-05-16
+
+## [0.74.0] - 2026-05-07
+
+## [0.73.1] - 2026-05-07
+
+## [0.73.0] - 2026-05-04
+
+## [0.72.1] - 2026-05-02
+
+### Changed
+
+- Changed the default agent transport to `auto` so providers can use their best available transport by default ([#4083](https://github.com/badlogic/pi-mono/issues/4083)).
+
+## [0.72.0] - 2026-05-01
+
+### Added
+
+- Added `shouldStopAfterTurn` to the low-level agent loop config for gracefully exiting after a completed turn before polling queued messages or starting another LLM call.
+
+## [0.71.1] - 2026-05-01
+
+## [0.71.0] - 2026-04-30
+
+## [0.70.6] - 2026-04-28
+
+## [0.70.5] - 2026-04-27
+
+## [0.70.4] - 2026-04-27
+
+## [0.70.3] - 2026-04-27
+
+## [0.70.2] - 2026-04-24
+
+## [0.70.1] - 2026-04-24
+
+## [0.70.0] - 2026-04-23
+
+## [0.69.0] - 2026-04-22
+
+### Breaking Changes
+
+- Migrated public TypeBox-facing types and examples from `@sinclair/typebox` 0.34.x to `typebox` 1.x. Install and import from `typebox` instead of relying on `@sinclair/typebox` transitively ([#3112](https://github.com/badlogic/pi-mono/issues/3112))
+
+### Added
+
+- Added `terminate: true` tool-result hints to skip the automatic follow-up LLM call when every finalized tool result in the current batch opts into early termination ([#3525](https://github.com/badlogic/pi-mono/issues/3525))
+
+## [0.68.1] - 2026-04-22
+
+### Fixed
+
+- Fixed `streamProxy()` to preserve the proxy-safe serializable subset of stream options, including session, transport, retry-delay, metadata, header, cache-retention, and thinking-budget settings ([#3512](https://github.com/badlogic/pi-mono/issues/3512))
+- Fixed parallel tool execution to emit `tool_execution_end` as soon as each tool is finalized, while still emitting persisted tool-result messages in assistant source order ([#3503](https://github.com/badlogic/pi-mono/issues/3503))
+
+## [0.68.0] - 2026-04-20
+
+### Changed
+
+- Clarified parallel tool execution ordering docs to specify that final tool lifecycle and tool-result artifacts are emitted in tool completion order.
+
+## [0.67.68] - 2026-04-17
+
+## [0.67.67] - 2026-04-17
+
+### Fixed
+
+- Fixed parallel tool-call finalization to convert `afterToolCall` hook throws into error tool results instead of aborting the batch ([#3084](https://github.com/badlogic/pi-mono/issues/3084))
+
+## [0.67.6] - 2026-04-16
+
+## [0.67.5] - 2026-04-16
+
+## [0.67.4] - 2026-04-16
+
+## [0.67.3] - 2026-04-15
+
+## [0.67.2] - 2026-04-14
+
+## [0.67.1] - 2026-04-13
+
+## [0.67.0] - 2026-04-13
+
+## [0.66.1] - 2026-04-08
+
+## [0.66.0] - 2026-04-08
+
 ## [0.65.2] - 2026-04-06
 
 ## [0.65.1] - 2026-04-05
